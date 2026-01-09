@@ -35,20 +35,22 @@ plt = plot_pc(target;markersize=1.5)
 plot_pc!(source;markersize=1.5)
 display(plt)
 println("Input 'continue' to run the registration algorithm")
-readline()
-final_R,final_t = register(source,target;
-    outlier_prior_prob = 0.,
-    R_hint = RotXYZ(deg2rad.([0,0,0])...), # True is about -1,34,0.5
-    sigmas_R_rad=deg2rad.([0.,0.,0.]),
-    t_hint = [0.0,0.000,0.0], # True is about -0.052,-0.0004,-0.011
-    sigmas_t = [0.0,0.0,0.0],
-    max_iters=100,
-    max_population=250
-)
-display(rad2deg.(Rotations.params(RotXYZ(RotMatrix3(final_R)))))
-display(final_t) 
-plt = plot_pc(target;markersize=1.5)
-# plot_pc!(source;markersize=1.5)
-transformed_source = final_R * source .+ final_t
-plot_pc!(transformed_source;markersize=1.5)
-display(plt)
+rd = readline()
+if rd == "continue"
+    final_R,final_t = register(source,target;
+        outlier_prior_prob = 0.,
+        R_hint = RotXYZ(deg2rad.([0,0,0])...), # True is about -1,34,0.5
+        sigmas_R_rad=deg2rad.([0.,0.,0.]),
+        t_hint = [0.0,0.000,0.0], # True is about -0.052,-0.0004,-0.011
+        sigmas_t = [0.0,0.0,0.0],
+        max_iters=100,
+        max_population=250
+    )
+    display(rad2deg.(Rotations.params(RotXYZ(RotMatrix3(final_R)))))
+    display(final_t) 
+    plt = plot_pc(target;markersize=1.5)
+    # plot_pc!(source;markersize=1.5)
+    transformed_source = final_R * source .+ final_t
+    plot_pc!(transformed_source;markersize=1.5)
+    display(plt)
+end

@@ -251,7 +251,10 @@ end
 Plots the point cloud using Makie
 """ 
 function plot_pc(pc; markersize=0.75)
-    Makie.scatter(pc[1,:], pc[2,:], pc[3,:]; markersize = markersize)
+    f = Figure(size=(900,900))
+    ax = LScene(f[1, 1])
+    Makie.scatter!(ax,pc[1,:], pc[2,:], pc[3,:]; markersize = markersize)
+    f
 end
 function plot_pc(pc, normals; arrow_scale = 40, markersize=0.75)
     plot = Makie.scatter(pc[1,:], pc[2,:], pc[3,:]; markersize = markersize)
