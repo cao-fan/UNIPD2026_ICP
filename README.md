@@ -1,3 +1,5 @@
+# To run the script a CUDA compatible GPU is required(see [CUDA.jl](https://cuda.juliagpu.org/stable/installation/overview/#InstallationOverview) for more info)
+
 Open the terminal in the project folder
 Install Julia 1.11.7(preferably through [JuliaUp](https://github.com/JuliaLang/juliaup))
 
