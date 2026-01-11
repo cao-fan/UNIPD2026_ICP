@@ -1,18 +1,10 @@
-import Random
-Random.seed!(42)
-
-using LinearAlgebra, Statistics, Rotations,
-      DelimitedFiles, StaticArrays, Tullio,
-      Statistics, PlyIO, CUDA
-
-# using Optim, Optimization, OptimizationOptimJL    
-
-using GLMakie#, CairoMakie
+using Rotations
 
 @info "Loading the dependencies..."
-include("point_cloud_utils.jl")
 include("solve_point_to_plane.jl")
-include("fixed_centroids_gmm.jl")
+using .SoftICP
+include("point_cloud_utils.jl")
+using .PointCloudUtils
 
 
 @info "Loading the data..."
@@ -24,8 +16,6 @@ bunny_1_covs = compute_covariances_from_unstructured_point_cloud(bunny_1,k=Val(8
 
 source          = bunny_1;#surface_0#bunny_1
 target          = bunny_0;#surface_1#bunny_0
-# source_normals  = surface_0_normals
-# target_normals  = surface_1_normals
 source_covs     = bunny_1_covs;#surface_0_covs
 target_covs     = bunny_0_covs;#surface_1_covs
 THRESHOLD       = 0.1;#10.#0.04

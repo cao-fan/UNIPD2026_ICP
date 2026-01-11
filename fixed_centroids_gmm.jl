@@ -1,3 +1,7 @@
+module FixedCentroidsGMM
+
+export hard_predict_gmm_kernel
+
 using StaticArrays, LinearAlgebra, Random, CUDA
 
 function sample_centroids(point_cloud, k)
@@ -250,4 +254,6 @@ function hard_predict_gmm_kernel(point_cloud, k = 100)
     covs = covs[:,:,good_indices]
     prior_probabilities = prior_probabilities[good_indices]
     return centroids_gpu, covs, prior_probabilities
+end
+
 end

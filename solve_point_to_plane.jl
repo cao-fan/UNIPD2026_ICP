@@ -1,26 +1,33 @@
+module SoftICP
+
+export register
+
 using CUDA
-# using NonlinearSolve
 using StaticArrays
 using LinearAlgebra
+using Random
+using Rotations
+Random.seed!(123)
+
+include("point_cloud_utils.jl")
+using .PointCloudUtils
+include("fixed_centroids_gmm.jl")
+using. FixedCentroidsGMM
 
 ################ GEOMETRIC TRANSFORMATIONS
 function get_rot_vec(R)
     return CUDA.@allowscalar Rotations.params(RotationVec(R))
 end
 
-function hat(x::T,y::T,z::T) where T
+function hat(v::AbstractVector{T}) where T
     #  0 -z  y
     #  z  0 -x 
     # -y  x  0
     # Column major
+    x = v[1]
+    y = v[2]
+    z = v[3]
     return SMatrix{3,3,T,9}(0,z,-y, -z,0,x, y,-x,0)
-end
-function hat(v::AbstractVector{T}) where T
-    return hat(v...)
-end
-function hat!(M,v)
-    M .= hat(v)
-    return nothing
 end
 
 function rodriguez(delta::AbstractVector{T}) where T
@@ -34,18 +41,6 @@ function rodriguez(delta::AbstractVector{T}) where T
     S_2 = normalized_delta*transpose(normalized_delta) - I
     R = I + sin(delta_norm)*S + (1-cos(delta_norm))*S_2
     return R
-end
-function rodriguez!(R,delta::AbstractVector{T}) where T
-    delta_norm = norm(delta)
-    if isapprox(delta_norm,zero(delta_norm))
-        return SMatrix{3,3,T}(I)
-    end
-    normalized_delta = delta/delta_norm
-    hat!(R,normalized_delta)
-    R .*= sin(delta_norm)
-    S_2 = normalized_delta*transpose(normalized_delta) - I
-    R .+= I + (1-cos(delta_norm))*S_2
-    return nothing
 end
 
 function left_jacobian(theta::AbstractVector{T}) where T
@@ -140,318 +135,7 @@ function compute_posteriors_kernel!(P, S, T, source_covs, target_covs, R, t, sou
     return nothing
 end
 
-############ NNLS
-
-function p2p_ml_cost_kernel(du,u,p)
-    S, T, S_covs, T_covs, P = p
-    index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    stride = gridDim().x * blockDim().x
-
-    M = size(S_covs,3)
-    N = size(T_covs,3)
-
-    indices = index:stride:(M*N)
-    
-    CI = CartesianIndices((M,N))
-
-    delta = SVector{3}(view(u,1:3))
-    R = SMatrix{3,3}(rodriguez(delta))
-    t = SVector{3}(view(u,4:6))
-
-    for k in indices
-        pair = CI[k]
-        j = pair[1]
-        i = pair[2]
-
-        Cx = SMatrix{3,3}(@view(S_covs[:,:,j]))
-        Cy = SMatrix{3,3}(@view(T_covs[:,:,i]))
-        x = SVector{3}(view(S,:,j))
-        y = SVector{3}(view(T,:,i))
-        W = Symmetric(R * Cx * transpose(R) + Cy)
-        d = y - (R * x + t)
-        F = cholesky(W)
-        CUDA.@atomic du[1] =  du[1] + P[j,i]/N * (dot(d, (F \ d)) + logdet(F))
-    end
-    return nothing 
-end
-function compute_p2p_ml_cost_kernel(gpu_u, gpu_p)
-    S, T, S_covs, T_covs, P = gpu_p
-    M = size(S_covs,3)
-    N = size(T_covs,3)
-    _gpu_p = (S, T, S_covs, T_covs, P)
-    gpu_du = cu([0.0])
-    kernel = @cuda launch=false p2p_ml_cost_kernel(gpu_du,gpu_u,_gpu_p)
-    config = launch_configuration(kernel.fun)
-    threads = min(M*N, config.threads)
-    blocks = cld(M*N, threads)
-    CUDA.@sync begin
-        @cuda threads=threads blocks=blocks p2p_ml_cost_kernel(gpu_du,gpu_u,_gpu_p)
-    end
-    return CUDA.@allowscalar gpu_du[1]
-end
-
-function p2p_ml_grad_kernel!(G,u,p)
-    # Compute the gradient wrt δ[i]
-    S, T, S_covs, T_covs, P = p
-    index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    stride = gridDim().x * blockDim().x
-
-    M = size(S_covs,3)
-    N = size(T_covs,3)
-
-    indices = index:stride:(M*N)
-    
-    CI = CartesianIndices((M,N))
-
-    R = SMatrix{3,3}(rodriguez(view(u,1:3)))
-    R_t = transpose(R)
-    t = SVector{3}(view(u,4:6))
-    
-    for k in indices
-        pair = CI[k]
-        j = pair[1]
-        i = pair[2]
-
-        Cx = SMatrix{3,3}(@view(S_covs[:,:,j]))
-        Cy = SMatrix{3,3}(@view(T_covs[:,:,i]))
-        x = SVector{3}(view(S,:,j))
-        y = SVector{3}(view(T,:,i))
-        M_mat = Symmetric(R * Cx * transpose(R) + Cy)
-        F = cholesky(M_mat)
-
-        d = y - (R * x + t)
-        p = F \ d
-        for l in 1:6
-            if l <= 3
-                if l == 1
-                    dδ = SVector{3}(1f0,0f0,0f0)
-                elseif l==2
-                    dδ = SVector{3}(0f0,1f0,0f0)
-                elseif l==3
-                    dδ = SVector{3}(0f0,0f0,1f0)
-                end
-                dδ_hat = hat(dδ)
-                dM = dδ_hat*R*Cx*R_t - R*Cx*R_t*dδ_hat
-                dd = -dδ_hat*R*x
-                W = F \ dM
-                CUDA.@atomic G[l] = G[l] + P[j,i]/N * (tr(W) + 2*transpose(p)*dd -transpose(p)*dM*p)
-            elseif 4 <= l <= 6
-                if l==4
-                    dt = SVector{3}(1f0,0f0,0f0)
-                elseif  l==5
-                    dt = SVector{3}(0f0,1f0,0f0)
-                elseif  l==6
-                    dt = SVector{3}(0f0,0f0,1f0)
-                end
-                dd = -dt
-                CUDA.@atomic G[l] = G[l] + P[j,i]/N * (2*transpose(p)*dd)
-            end
-        end
-    end
-    
-    
-    return nothing 
-end
-function compute_p2p_ml_grad_kernel!(gpu_G,gpu_u,gpu_p)
-    S, T, S_covs, T_covs, P = gpu_p
-    M = size(S_covs,3)
-    N = size(T_covs,3)
-
-    kernel = @cuda launch=false p2p_ml_grad_kernel!(gpu_G,gpu_u,gpu_p)
-    config = launch_configuration(kernel.fun)
-    threads = min(M*N, config.threads)
-    blocks = cld(M*N, threads)
-    gpu_G .= 0
-    CUDA.@sync begin
-        @cuda threads=threads blocks=blocks p2p_ml_grad_kernel!(gpu_G,gpu_u,gpu_p)
-    end
-    return nothing
-end
-
-function p2p_ml_grad_split_kernel!(gpu_slit_G,u,p)
-    S, T, S_covs, T_covs, P = p
-    index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    stride = gridDim().x * blockDim().x
-
-    M = size(S_covs,3)
-    N = size(T_covs,3)
-
-    indices = index:stride:(M*N)
-    
-    CI = CartesianIndices((M,N))
-
-    R = SMatrix{3,3}(rodriguez(view(u,1:3)))
-    R_t = transpose(R)
-    t = SVector{3}(view(u,4:6))
-
-
-    for k in indices
-        pair = CI[k]
-        j = pair[1]
-        i = pair[2]
-
-        Cx = SMatrix{3,3}(@view(S_covs[:,:,j]))
-        Cy = SMatrix{3,3}(@view(T_covs[:,:,i]))
-        x = SVector{3}(view(S,:,j))
-        y = SVector{3}(view(T,:,i))
-        M_mat = Symmetric(R * Cx * transpose(R) + Cy)
-        F = cholesky(M_mat)
-
-        d = y - (R * x + t)
-        p = F \ d
-        for l in 1:3
-            if l == 1
-                dδ = SVector{3}(1f0,0f0,0f0)
-            elseif l==2
-                dδ = SVector{3}(0f0,1f0,0f0)
-            elseif l==3
-                dδ = SVector{3}(0f0,0f0,1f0)
-            end
-
-            dδ_hat = hat(dδ)
-            dM = dδ_hat*R*Cx*R_t - R*Cx*R_t*dδ_hat
-            dd = -dδ_hat*R*x
-            W = F \ dM
-            CUDA.@atomic gpu_slit_G[1,l] = gpu_slit_G[1,l] + P[j,i]/N * (2*transpose(p)*dd)
-            CUDA.@atomic gpu_slit_G[2,l] = gpu_slit_G[2,l] + P[j,i]/N * (- transpose(p)*dM*p)
-            CUDA.@atomic gpu_slit_G[3,l] = gpu_slit_G[3,l] + P[j,i]/N * (tr(W))
-        end
-
-        for l in 4:6
-            if l==4
-                dt = SVector{3}(1f0,0f0,0f0)
-            elseif  l==5
-                dt = SVector{3}(0f0,1f0,0f0)
-            elseif  l==6
-                dt = SVector{3}(0f0,0f0,1f0)
-            end
-            dd = -dt
-            CUDA.@atomic gpu_slit_G[1,l] = gpu_slit_G[1,l] + P[j,i]/N * (2*transpose(p)*dd)
-            CUDA.@atomic gpu_slit_G[2,l] = gpu_slit_G[2,l] + P[j,i]/N * (2*transpose(p)*dd)
-            CUDA.@atomic gpu_slit_G[3,l] = gpu_slit_G[3,l] + P[j,i]/N * (2*transpose(p)*dd)
-        end
-    end
-    
-    return nothing 
-end
-function compute_p2p_ml_grad_split_kernel!(gpu_G_split,gpu_u,gpu_p)
-    S, T, S_covs, T_covs, P = gpu_p
-    M = size(S_covs,3)
-    N = size(T_covs,3)
-
-    kernel = @cuda launch=false p2p_ml_grad_split_kernel!(gpu_G_split,gpu_u,gpu_p)
-    config = launch_configuration(kernel.fun)
-    threads = min(M*N, config.threads)
-    blocks = cld(M*N, threads)
-    gpu_G_split .= 0
-    CUDA.@sync begin
-        @cuda threads=threads blocks=blocks p2p_ml_grad_split_kernel!(gpu_G_split,gpu_u,gpu_p)
-    end
-    return nothing
-end
-
 ####################### Linear approximation nonlinear least squares
-
-function lower_matrix(A)
-    return LowerTriangular(A) - diagm(diag(A))/2
-end
-
-function prepare_A_b_mahal!(A,b,_R,_t,S,T,S_covs,T_covs,P)
-    index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    stride = gridDim().x * blockDim().x
-
-    M = size(S_covs,3)
-    N = size(T_covs,3)
-
-    indices = index:stride:(N)
-    
-    CI = CartesianIndices((N,)) 
-
-    local_A = @SMatrix zeros(Float32,6,6)
-    local_b = @SVector zeros(Float32,6)
-    J = @SMatrix zeros(Float32,3,6)
-
-    R = SMatrix{3,3}(_R)
-    t = SVector{3}(_t)
-    R_t = transpose(R)
-    for k in indices
-        pair = CI[k]
-        i = pair[1]
-
-        Cy = SMatrix{3,3}(view(T_covs,:,:,i))
-        y = SVector{3}(view(T,:,i))
-        for j in axes(S_covs,3) #1:M
-            Cx = SMatrix{3,3}(view(S_covs,:,:,j))
-            x = SVector{3}(view(S,:,j))
-            M_mat = R * Cx * R_t
-            U = Symmetric(M_mat + Cy)
-            F = cholesky(U)
-            L = SMatrix{3,3}(F.L)
-            d = y - R*x - t
-            p = L \ d
-            L_inv = inv(L)
-            
-            dδ = SVector{3,Float32}(1,0,0)
-            G = SMatrix{3,3}(hat(dδ))
-            dA = G*M_mat - M_mat*G
-            dL_inv_d_1 = - lower_matrix(L_inv * dA * transpose(L_inv)) * p
-
-            dδ = SVector{3,Float32}(0,1,0)
-            G = SMatrix{3,3}(hat(dδ))
-            dA = G*M_mat - M_mat*G
-            dL_inv_d_2 = - lower_matrix(L_inv * dA * transpose(L_inv)) * p
-
-            dδ = SVector{3,Float32}(0,0,1)
-            G = SMatrix{3,3}(hat(dδ))
-            dA = G*M_mat - M_mat*G
-            dL_inv_d_3 = - lower_matrix(L_inv * dA * transpose(L_inv)) * p
-            
-            Q = hcat(dL_inv_d_1,dL_inv_d_2,dL_inv_d_3)
-            J = hcat(Q + L_inv * SMatrix{3,3}(hat(R*x)),-L_inv)
-            A_ji = transpose(J) * J
-            b_ji = transpose(J) * p
-            local_A += A_ji * P[j,i] / N
-            local_b += -b_ji * P[j,i] / N
-        end
-    end
-
-    for idx in eachindex(b)
-        CUDA.@atomic b[idx] = b[idx] + local_b[idx]
-    end
-    for idx in eachindex(A)
-        CUDA.@atomic A[idx] = A[idx] + local_A[idx]
-    end
-    return nothing
-end
-function solve_A_b_mahal_for_theta_kernel(A,b,R,t,S,T,S_covs,T_covs,P;prior_R,prior_t,Sigma_inv_R,Sigma_inv_t)
-    M = size(S_covs,3)
-    N = size(T_covs,3)
-    
-    kernel = @cuda launch=false prepare_A_b_mahal!(A,b,R,t,S,T,S_covs,T_covs,P)
-    config = launch_configuration(kernel.fun)
-    threads = min(N, config.threads)
-    blocks = cld(N, threads)
-    
-    A .= 0f0
-    b .= 0f0
-    CUDA.@sync begin
-        @cuda threads=threads blocks=blocks prepare_A_b_mahal!(A,b,R,t,S,T,S_covs,T_covs,P)
-    end
-    CUDA.@allowscalar begin
-        τ = get_rot_vec(R*transpose(prior_R)) |> Array |> cu
-        Jₗ⁻¹ = left_jacobian_inverse(τ) |> Array |> cu
-        Jₗ⁻ᵀ = transpose(Jₗ⁻¹)
-        A[1:3,1:3] .+= Jₗ⁻ᵀ * Sigma_inv_R * Jₗ⁻¹ # * N
-        A[4:6,4:6] .+= Sigma_inv_t # * N
-        b[1:3] .+= -Jₗ⁻ᵀ * Sigma_inv_R * τ # * N
-        b[4:6] .+= Sigma_inv_t * (prior_t-t) # * N
-    end
-    Δθ = A \ b
-    return Δθ
-end
-
-
-
 
 function prepare_A_b!(A,b,_R,S,T,S_covs,T_covs,P)
     index = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -584,96 +268,6 @@ function compute_p2p_ml_cost_kernel_with_prior(gpu_R, gpu_t, gpu_p, prior_R,prio
 end
 #################
 
-
-function icp_plane2plane_ml_coordinate_descent(source_pc::AbstractMatrix{T}, target_pc::AbstractMatrix{T}, outlier_prior_prob = 0.1;R,t, max_iters = 10, max_population=1_000) where T
-    Random.seed!(42)
-    # Subsample the point cloud
-    resampled_source_pc, resampled_source_covs, source_mixing_prior = hard_predict_gmm_kernel(cu(source_pc), max_population)#hard_predict_gmm(source_pc[:,idx_subsample], max_population) .|> cu
-    resampled_source_covs = resampled_source_covs
-    # idx_subsample = rpcidx(target_pc)
-    resampled_target_pc, resampled_target_covs, target_mixing_prior = hard_predict_gmm_kernel(cu(target_pc), max_population)#hard_predict_gmm(target_pc[:,idx_subsample], max_population) .|> cu
-    resampled_target_covs = resampled_target_covs
-    
-    dtot_history = []
-    dd_history = []
-    ddet_history = []
-    dM_history = []
-    obj_history = []
-
-    M, N = size(resampled_source_pc,2),size(resampled_target_pc,2)
-
-    # Initialize the parameters
-    R = cu(Matrix(R))
-    t = cu(t)
-    P = cu(ones(Float64,M+1, N))
-    P .= P ./ (M+1)
-    θ = cu(1e-2*randn(6))
-    θ[1:3] = get_rot_vec(R)
-    θ[4:6] = t
-    grad_cache = CUDA.zeros(6)
-    split_grad_cache = CUDA.zeros(3,6)
-    
-    loss = Inf
-    best_loss = Inf
-    patience = 0
-
-    cov_mult = 1f0
-
-    p = (resampled_source_pc, resampled_target_pc, resampled_source_covs, resampled_target_covs, P)
-    opt_f = OptimizationFunction(compute_p2p_ml_cost_kernel; grad=compute_p2p_ml_grad_kernel!)
-    prob = OptimizationProblem(opt_f, θ, p)
-
-    for i in 1:max_iters
-        @info "Iteration $i/$max_iters"
-        # Log gradient
-        compute_p2p_ml_grad_split_kernel!(split_grad_cache, θ, p)
-        push!(dd_history,split_grad_cache[1,1:3])
-        push!(dM_history,split_grad_cache[2,1:3])
-        push!(ddet_history,split_grad_cache[3,1:3])
-        _obj = compute_p2p_ml_cost_kernel(θ,p)
-        push!(obj_history,_obj)
-        compute_p2p_ml_grad_kernel!(grad_cache,θ,p)
-        push!(dtot_history,grad_cache[1:3])
-        # Compute posterior probabilities
-        posterior_time = @elapsed begin
-            compute_posteriors_kernel!(P, resampled_source_pc, resampled_target_pc, resampled_source_covs, resampled_target_covs, R, t, source_mixing_prior, outlier_prior_prob, cov_mult) # (N_x+1,N_y)
-        end
-
-        # Define the optimization problem
-        p = (resampled_source_pc, resampled_target_pc, resampled_source_covs, resampled_target_covs, P)
-        prob = remake(prob; u0 = θ, p = p)
-        solve_time = @elapsed CUDA.@allowscalar sol = solve(prob, Optim.GradientDescent(;alphaguess=0.001,linesearch = Optim.LineSearches.HagerZhang()), maxiters=10)#solve(prob, Optim.GradientDescent(;alphaguess=1.,linesearch = Optim.LineSearches.StrongWolfe()), maxiters=4)
-        θ = sol.u
-        # Update
-        @CUDA.allowscalar R = rodriguez(θ[1:3])
-        t = θ[4:6]
-
-        loss = sol.objective
-        if best_loss == Inf || loss < (best_loss-abs(best_loss)*0.01/100)
-            best_loss = loss
-            patience = 0
-        else
-            patience += 1
-        end
-
-        if patience > 1 && i>20 && norm(grad_cache) < 1e-1
-            break
-        end
-        # if (i-1)%40 == 0
-        #     plot = plot_pc(target_pc;markersize=1.5)
-        #     transformed_source = Array(R) * source_pc .+ Array(t)
-        #     plot_pc!(transformed_source;markersize=1.5)
-        #     save("$i.pdf",plot,backend=CairoMakie)
-        # end
-    end
-    plot = plot_pc(target_pc;markersize=1.5)
-    transformed_source = Array(R) * source_pc .+ Array(t)
-    plot_pc!(transformed_source;markersize=1.5)
-    # save("final_step.pdf",plot,backend=CairoMakie)
-    return Array(R), Array(t), (dtot_history,dd_history,ddet_history,dM_history,obj_history)
-end
-
-
 function icp_plane2plane_ml_approximation_closed_form(source_pc::AbstractMatrix{T}, target_pc::AbstractMatrix{T};prior_R=cu(I(3)), prior_t=CUDA.zeros(3), Sigma_inv_R=CUDA.zeros(3,3), Sigma_inv_t=CUDA.zeros(3,3), outlier_prior_prob=0.0, max_iters = 100, max_population=100, gauss_newton_max_iters=10, grad_eps_termination=100*eps(Float32)) where T 
     function update_R(theta,R)
         CUDA.@allowscalar begin
@@ -737,7 +331,7 @@ function icp_plane2plane_ml_approximation_closed_form(source_pc::AbstractMatrix{
         for inner_iter in 1:gauss_newton_max_iters
             _Sigma_inv_R = get_Sigma_inv_XYZ(Sigma_inv_R,R)
             # Gauss-Newton step
-            Δθ = solve_A_b_mahal_for_theta_kernel(
+            Δθ = solve_A_b_for_theta_kernel(
                 A_cache,b_cache,R,t,resampled_source_pc,resampled_target_pc,resampled_source_covs,resampled_target_covs,P;
                 prior_R=prior_R, prior_t=prior_t, Sigma_inv_R=_Sigma_inv_R, Sigma_inv_t=Sigma_inv_t
             )
@@ -774,17 +368,10 @@ function icp_plane2plane_ml_approximation_closed_form(source_pc::AbstractMatrix{
         if norm_theta_change < grad_eps_termination
             break
         end
-        # if (i-1)%5 == 0
-        #     plot = plot_pc(target_pc;markersize=1.5)
-        #     transformed_source = Array(R) * source_pc .+ Array(t)
-        #     plot_pc!(transformed_source;markersize=1.5)
-        #     save("mahal_full_$i.pdf",plot,backend=CairoMakie)
-        # end
     end
     plot = plot_pc(target_pc;markersize=1.5)
     transformed_source = Array(R) * source_pc .+ Array(t)
     plot_pc!(transformed_source;markersize=1.5)
-    # save("mahal_full_final_step.pdf",plot,backend=CairoMakie)
     return Array(R), Array(t)
 end
 
@@ -830,36 +417,4 @@ function register(source, target;outlier_prior_prob=0.0, R_hint=Matrix(I(3)), t_
     return final_R, final_t
 end
 
-# history = let 
-#     R_hint = RotXYZ(deg2rad.([0.,0.,0.])...)#I(3)
-#     t_hint = [0.0,0.0,0.0]#[0,0,0]#[-0.05, 0.0,-0.01]#[0,300,0]#
-#     source_mean,target_mean,scaling = normalize_point_clouds(source, target)
-#     normalized_source = scaling*(source .- source_mean)
-#     normalized_target = scaling*(target .- target_mean)
-#     opt_R, opt_t, history = icp_plane2plane_ml_coordinate_descent(normalized_source, normalized_target, 0., max_iters=200, max_population=250, R=R_hint, t=scaling*(t_hint - target_mean + R_hint*source_mean))
-#     final_R = opt_R
-#     final_t = opt_t / scaling + target_mean - opt_R*source_mean
-#     display(rad2deg.(Rotations.params(RotXYZ(RotMatrix3(final_R)))))
-#     display(final_t)
-#     plot = plot_pc(target;markersize=1.5)
-#     # plot_pc!(source;markersize=1.5)
-#     transformed_source = final_R * source .+ final_t
-#     plot_pc!(transformed_source;markersize=1.5)
-#     display(plot)
-#     history
-# end
-
-# let 
-#     dtot_history,dd_history,ddet_history,dM_history,obj_history = history
-#     using CairoMakie
-#     f = Figure()
-#     ax = f[1,1] = Axis(f,title = "Gradient norm", limits = (nothing, nothing), xlabel="Iteration")
-#     plot!(dtot_history, label="Total gradient")
-#     plot!(dd_history, label="∂d")
-#     plot!(ddet_history, label="∂|A|")
-#     plot!(dM_history, label="dA⁻¹")
-#     plot!(obj_history, label="Objective value")
-#     f[1,2] = Legend(f,ax)
-#     save("Gradient_norm_p2p.pdf",f)
-#     f
-# end
+end
