@@ -1,7 +1,16 @@
-Install Julia 1.11.7
-Download the repository, open Julia 1.11.7 in the terminal, enter Package Mode by pressing ']' and then run:
+Open the terminal in the project folder
+Install Julia 1.11.7(preferably through [JuliaUp](https://github.com/JuliaLang/juliaup))
+
+> juliaup add 1.11.7
+>
+> julia +1.11.7
+
+`cd(raw"<folder path>")` into the folder using the Julia REPL if you are not already inside the project folder.
+
+Enter Package Mode by pressing ']' and then run:
 
 > activate .
+> 
 > instantiate
 
 To run the program run:
