@@ -29,7 +29,7 @@ println("Input 'continue' to run the registration algorithm")
 rd = readline()
 if rd == "continue"
     @info "Setting up the solver..."
-    final_R,final_t = register(source,target;
+    final_R,final_t = SoftICP.register(source,target;
         outlier_prior_prob = 0.,
         R_hint = RotXYZ(deg2rad.([0,0,0])...), # True is about -1,34,0.5
         sigmas_R_rad=deg2rad.([0.,0.,0.]),
